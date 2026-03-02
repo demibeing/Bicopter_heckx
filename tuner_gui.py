@@ -1,7 +1,3 @@
-# tuner_gui.py
-# Requires: pyserial, matplotlib
-# pip install pyserial matplotlib
-
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial
@@ -13,255 +9,177 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 import collections
 
-BAUD = 115200
-
-class SerialThread(threading.Thread):
-    def __init__(self, port, baud, q):
-        super().__init__(daemon=True)
-        self.port = port
-        self.baud = baud
-        self.q = q
-        self.alive = True
-        self.ser = None
-        try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
-        except Exception as e:
-            self.ser = None
-            print("Serial open error:", e)
-            raise
-
-    def run(self):
-        buf = ""
-        while self.alive:
-            try:
-                data = self.ser.read(200)
-            except Exception as e:
-                print("Serial read error:", e)
-                break
-            if data:
-                try:
-                    s = data.decode('utf-8', errors='ignore')
-                except:
-                    s = str(data)
-                buf += s
-                # split lines
-                while '\n' in buf:
-                    line, buf = buf.split('\n', 1)
-                    line = line.strip()
-                    if line:
-                        self.q.put(line)
-            else:
-                time.sleep(0.01)
-
-    def write_line(self, line):
-        if self.ser and self.ser.is_open:
-            self.ser.write((line + '\n').encode('utf-8'))
-
-    def close(self):
-        self.alive = False
-        try:
-            if self.ser and self.ser.is_open:
-                self.ser.close()
-        except:
-            pass
-
-class TunerGUI:
+class BicopterTuner:
     def __init__(self, root):
         self.root = root
-        root.title("Bicopter PID Tuner")
+        self.root.title("Bicopter Pro PID Tuner - Large View")
+        
+        # 1. Increase the starting window size
+        self.root.geometry("1400x900")
+        
         self.serial_thread = None
         self.q = queue.Queue()
+        self.is_connected = False
 
-        # Left frame: controls
-        left = ttk.Frame(root, padding=6)
-        left.grid(row=0, column=0, sticky='ns')
+        # Define Large Fonts
+        self.label_font = ("Arial", 12, "bold")
+        self.slider_font = ("Arial", 10)
+        self.header_font = ("Arial", 14, "bold")
 
-        # COM port selection
-        ttk.Label(left, text="Serial Port:").grid(row=0, column=0, sticky='w')
-        self.port_cb = ttk.Combobox(left, values=self.list_ports(), width=20)
-        self.port_cb.grid(row=1, column=0, sticky='w')
-        ttk.Button(left, text="Refresh", command=self.refresh_ports).grid(row=1, column=1, padx=4)
+        # --- Layout ---
+        # Left Side: Controls (Wider for longer sliders)
+        self.left_frame = ttk.Frame(root, padding=20)
+        self.left_frame.grid(row=0, column=0, sticky="ns")
 
-        self.connect_btn = ttk.Button(left, text="Connect", command=self.toggle_connect)
-        self.connect_btn.grid(row=2, column=0, pady=6, sticky='w')
-
-        # Sliders (AKP, RKP, RKI, RKD)
-        self.sliders = {}
-        sliders_def = [
-            ("AKP (angle Kp)", "AKP", 0.0, 20.0, 3.0),
-            ("RKP (rate Kp)", "RKP", 0.0, 5.0, 0.8),
-            ("RKI (rate Ki)", "RKI", 0.0, 1.0, 0.05),
-            ("RKD (rate Kd)", "RKD", 0.0, 2.0, 0.12),
-        ]
-        r = 3
-        for label, tag, vmin, vmax, vdef in sliders_def:
-            ttk.Label(left, text=label).grid(row=r, column=0, sticky='w', pady=(6,0))
-            s = tk.Scale(left, from_=vmin, to=vmax, resolution=0.01, orient=tk.HORIZONTAL, length=260,
-                         command=lambda val, t=tag: self.slider_changed(t, val))
-            s.set(vdef)
-            s.grid(row=r+1, column=0, columnspan=2)
-            self.sliders[tag] = s
-            r += 2
-
-        # EEPROM save/load
-        ttk.Button(left, text="Save to EEPROM", command=self.save_eeprom).grid(row=r, column=0, pady=8, sticky='w')
-        ttk.Button(left, text="Load from EEPROM", command=self.load_eeprom).grid(row=r, column=1, pady=8)
-
-        # Telemetry labels
-        self.tlm_vars = {
-            'roll_angle': tk.StringVar(value="roll: --"),
-            'gyro_rate': tk.StringVar(value="gyro: --"),
-            'target_roll': tk.StringVar(value="target: --"),
-            'deflection': tk.StringVar(value="defl: --"),
-        }
-        rr = r + 1
-        for i, (k, v) in enumerate(self.tlm_vars.items()):
-            ttk.Label(left, textvariable=v).grid(row=rr + i, column=0, sticky='w')
-
-        # Right frame: plot
-        right = ttk.Frame(root, padding=6)
-        right.grid(row=0, column=1, sticky='nsew')
+        # Right Side: Real-time Plot
+        self.right_frame = ttk.Frame(root, padding=10)
+        self.right_frame.grid(row=0, column=1, sticky="nsew")
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
-        self.fig, self.ax = plt.subplots(figsize=(6,3))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        # --- Connection Setup ---
+        conn_frame = ttk.LabelFrame(self.left_frame, text=" Connection ", padding=10)
+        conn_frame.pack(fill="x", pady=10)
+        
+        self.port_cb = ttk.Combobox(conn_frame, values=[p.device for p in serial.tools.list_ports.comports()], 
+                                    width=20, font=self.slider_font)
+        self.port_cb.pack(side=tk.LEFT, padx=10)
+        
+        self.btn_connect = tk.Button(conn_frame, text="CONNECT", command=self.toggle_connection, 
+                                     bg="#e1e1e1", font=self.label_font, padx=10)
+        self.btn_connect.pack(side=tk.LEFT, padx=10)
 
-        self.xdata = collections.deque(maxlen=400)
-        self.ydata = collections.deque(maxlen=400)
-        self.line, = self.ax.plot([], [], label='roll_angle')
+        # --- Tuning Sliders (Two Massive Columns) ---
+        self.sliders = {}
+        tune_container = ttk.Frame(self.left_frame)
+        tune_container.pack(fill="both", expand=True)
+
+        # Roll Column
+        roll_col = ttk.LabelFrame(tune_container, text=" ROLL (Servos) ", padding=15)
+        roll_col.pack(side=tk.LEFT, fill="both", expand=True, padx=5)
+        self.add_slider(roll_col, "Angle P (AKP)", "AKP", 0, 15, 3.0)
+        self.add_slider(roll_col, "Rate P (RKP)", "RKP", 0, 2.0, 0.2)
+        self.add_slider(roll_col, "Rate I (RKI)", "RKI", 0, 1.0, 0.05)
+        self.add_slider(roll_col, "Rate D (RKD)", "RKD", 0, 0.5, 0.02)
+
+        # Pitch Column
+        pitch_col = ttk.LabelFrame(tune_container, text=" PITCH (Motors) ", padding=15)
+        pitch_col.pack(side=tk.LEFT, fill="both", expand=True, padx=5)
+        self.add_slider(pitch_col, "Angle P (PAKP)", "PAKP", 0, 15, 3.0)
+        self.add_slider(pitch_col, "Rate P (PRKP)", "PRKP", 0, 2.0, 0.15)
+        self.add_slider(pitch_col, "Rate I (PRKI)", "PRKI", 0, 1.0, 0.05)
+        self.add_slider(pitch_col, "Rate D (PRKD)", "PRKD", 0, 0.5, 0.05)
+
+        # Commands (Bigger Buttons)
+        cmd_frame = ttk.Frame(self.left_frame, padding=10)
+        cmd_frame.pack(fill="x")
+        tk.Button(cmd_frame, text="SYNC FROM DRONE", font=self.label_font, 
+                  command=self.sync_drone, bg="#d1e7ff").pack(side=tk.LEFT, expand=True, fill="x", padx=5)
+        tk.Button(cmd_frame, text="SAVE TO EEPROM", font=self.label_font, 
+                  command=self.save_drone, bg="#d1ffd1").pack(side=tk.LEFT, expand=True, fill="x", padx=5)
+
+        # --- Telemetry Status ---
+        self.lbl_telem = tk.Label(self.left_frame, text="Telemetry: Waiting...", 
+                                  font=("Courier", 14, "bold"), justify=tk.LEFT, fg="#333")
+        self.lbl_telem.pack(pady=20)
+
+        # --- Plotting Setup ---
+        self.fig, self.ax = plt.subplots(figsize=(8, 6))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        
+        self.xdata = collections.deque(maxlen=300)
+        self.roll_y = collections.deque(maxlen=300)
+        self.pitch_y = collections.deque(maxlen=300)
+        self.roll_line, = self.ax.plot([], [], label="Roll Angle", color="blue", linewidth=2)
+        self.pitch_line, = self.ax.plot([], [], label="Pitch Angle", color="red", linewidth=2)
+        
         self.ax.set_ylim(-50, 50)
-        self.ax.set_xlim(0, 10)
-        self.ax.grid(True)
-        self.ax.legend(loc='upper right')
+        self.ax.set_title("Real-time Flight Data", fontsize=16)
+        self.ax.legend(loc="upper right", fontsize=12)
+        self.ax.grid(True, which='both', linestyle='--', alpha=0.5)
         self.start_time = time.time()
 
-        # periodic GUI update
         self.root.after(50, self.process_queue)
-        self.root.after(200, self.update_plot)
 
-    def list_ports(self):
-        ports = serial.tools.list_ports.comports()
-        return [p.device for p in ports]
+    def add_slider(self, parent, label, tag, vmin, vmax, vdef):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=10)
+        
+        ttk.Label(frame, text=label, font=self.label_font).pack(anchor="w")
+        
+        # length: Horizontal size in pixels
+        # width: Vertical thickness of the slider bar
+        # sliderlength: Size of the actual handle you grab
+        s = tk.Scale(frame, from_=vmin, to=vmax, resolution=0.01, orient=tk.HORIZONTAL,
+                     length=400, width=25, sliderlength=40, font=self.slider_font,
+                     command=lambda val: self.send_gain(tag, val))
+        s.set(vdef)
+        s.pack(fill="x", pady=5)
+        self.sliders[tag] = s
 
-    def refresh_ports(self):
-        self.port_cb['values'] = self.list_ports()
-
-    def toggle_connect(self):
-        if self.serial_thread:
-            # disconnect
-            self.serial_thread.close()
-            self.serial_thread = None
-            self.connect_btn.config(text="Connect")
+    def toggle_connection(self):
+        if not self.is_connected:
+            try:
+                port = self.port_cb.get()
+                self.ser = serial.Serial(port, 115200, timeout=0.1)
+                self.is_connected = True
+                self.btn_connect.config(text="DISCONNECT", bg="#ffcccc")
+                threading.Thread(target=self.serial_reader, daemon=True).start()
+                time.sleep(1)
+                self.sync_drone()
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not connect: {e}")
         else:
-            port = self.port_cb.get()
-            if not port:
-                messagebox.showerror("Error", "Select a serial port first")
-                return
+            self.is_connected = False
+            self.ser.close()
+            self.btn_connect.config(text="CONNECT", bg="#e1e1e1")
+
+    def send_gain(self, tag, val):
+        if self.is_connected:
+            msg = f"{tag} {val}\n"
+            self.ser.write(msg.encode())
+
+    def sync_drone(self):
+        if self.is_connected: self.ser.write(b"REQ\n")
+
+    def save_drone(self):
+        if self.is_connected: self.ser.write(b"SAVE\n")
+
+    def serial_reader(self):
+        while self.is_connected:
             try:
-                self.serial_thread = SerialThread(port, BAUD, self.q)
-                self.serial_thread.start()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to open port: {e}")
-                self.serial_thread = None
-                return
-            self.connect_btn.config(text="Disconnect")
-            # send immediate telemetry request
-            time.sleep(0.05)
-            self.send_line("REQTLM")
-
-    def slider_changed(self, tag, val):
-        # send command immediately when slider changes
-        cmd = f"{tag}{float(val):.3f}"
-        self.send_line(cmd)
-
-    def send_line(self, line):
-        if self.serial_thread:
-            try:
-                self.serial_thread.write_line(line)
-            except Exception as e:
-                print("Write error:", e)
-
-    def save_eeprom(self):
-        self.send_line("SAVE")
-
-    def load_eeprom(self):
-        self.send_line("LOAD")
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line: self.q.put(line)
+            except: pass
 
     def process_queue(self):
-        # called periodically on main thread
-        updated = False
         while not self.q.empty():
             line = self.q.get_nowait()
-            # print("RX:", line)
             if line.startswith("TLM,"):
-                # TLM,roll_angle,gyro_rate,target_roll,deflection
                 parts = line.split(',')
                 try:
-                    roll_angle = float(parts[1])
-                    gyro_rate = float(parts[2])
-                    target_roll = float(parts[3])
-                    deflection = float(parts[4])
-                except:
-                    continue
-                self.tlm_vars['roll_angle'].set(f"roll: {roll_angle:.2f}°")
-                self.tlm_vars['gyro_rate'].set(f"gyro: {gyro_rate:.2f}°/s")
-                self.tlm_vars['target_roll'].set(f"target: {target_roll:.2f}°")
-                self.tlm_vars['deflection'].set(f"defl: {deflection:.0f}")
-
-                t = time.time() - self.start_time
-                self.xdata.append(t)
-                self.ydata.append(roll_angle)
-                updated = True
-            else:
-                # parse simple text responses like "AKP 4.2" or "SAVED"
-                if line.startswith("AKP"):
-                    try:
-                        val = float(line.split()[1])
-                        self.sliders['AKP'].set(val)
-                    except:
-                        pass
-                if line.startswith("RKP"):
-                    try:
-                        val = float(line.split()[1])
-                        self.sliders['RKP'].set(val)
-                    except:
-                        pass
-                if line.startswith("RKI"):
-                    try:
-                        val = float(line.split()[1])
-                        self.sliders['RKI'].set(val)
-                    except:
-                        pass
-                if line.startswith("RKD"):
-                    try:
-                        val = float(line.split()[1])
-                        self.sliders['RKD'].set(val)
-                    except:
-                        pass
-                # you can inspect other lines in the console
-                print("->", line)
-
-        if updated:
-            # keep x-axis window shifted to last 10 seconds
-            if self.xdata:
-                span = max(10.0, self.xdata[-1] - (self.xdata[0] if self.xdata else 0))
-                self.ax.set_xlim(max(0, self.xdata[-1] - 10.0), self.xdata[-1] + 0.1)
-            self.line.set_data(self.xdata, self.ydata)
-            self.canvas.draw_idle()
-
+                    r, p = float(parts[1]), float(parts[2])
+                    ef, eb = parts[3], parts[4]
+                    t = time.time() - self.start_time
+                    self.xdata.append(t)
+                    self.roll_y.append(r)
+                    self.pitch_y.append(p)
+                    self.roll_line.set_data(self.xdata, self.roll_y)
+                    self.pitch_line.set_data(self.xdata, self.pitch_y)
+                    self.ax.set_xlim(max(0, t-15), t+1) # 15 second window
+                    self.canvas.draw_idle()
+                    self.lbl_telem.config(text=f"ROLL: {r:>5.1f}°\nPITCH: {p:>4.1f}°\nESC F: {ef}\nESC B: {eb}")
+                except: pass
+            elif line.startswith("SYNC,"):
+                p = line.split(',')
+                tags = ["AKP", "RKP", "RKI", "RKD", "PAKP", "PRKP", "PRKI", "PRKD"]
+                for i, tag in enumerate(tags):
+                    if i+1 < len(p):
+                        self.sliders[tag].set(float(p[i+1]))
         self.root.after(50, self.process_queue)
-
-    def update_plot(self):
-        # keep axes updated even if no new data
-        if self.xdata:
-            self.ax.relim()
-            self.ax.autoscale_view(scalex=False, scaley=False)
-            self.canvas.draw_idle()
-        self.root.after(200, self.update_plot)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = TunerGUI(root)
+    app = BicopterTuner(root)
     root.mainloop()
