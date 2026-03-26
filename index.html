@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bicopter OS Pro</title>
+    <style>
+        :root { --bg: #0f111a; --panel: #1a1d2d; --accent: #00d2ff; --text: #e0e6ed; --alert: #ff4757; --success: #2ed573; --chart-bg: #0a0c13; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        
+        .sidebar { width: 220px; background: var(--panel); display: flex; flex-direction: column; border-right: 1px solid #2a2e45; flex-shrink: 0; }
+        .logo { padding: 20px; font-size: 22px; font-weight: 800; color: var(--accent); text-align: center; border-bottom: 1px solid #2a2e45; letter-spacing: 2px; }
+        .menu-item { padding: 18px 20px; cursor: pointer; transition: 0.2s; font-weight: 600; border-left: 3px solid transparent; color: #888; }
+        .menu-item:hover, .menu-item.active { background: #23273a; border-left-color: var(--accent); color: white; }
+        
+        .main { flex-grow: 1; padding: 25px; overflow-y: auto; display: flex; flex-direction: column; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        .status-badge { padding: 8px 15px; border-radius: 20px; font-weight: bold; font-size: 14px; background: #333; }
+        .connected { background: rgba(46, 213, 115, 0.2); color: var(--success); border: 1px solid var(--success); }
+        .disconnected { background: rgba(255, 71, 87, 0.2); color: var(--alert); border: 1px solid var(--alert); }
+        
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .card { background: var(--panel); padding: 20px; border-radius: 12px; border: 1px solid #2a2e45; margin-bottom: 20px;}
+        h3 { margin-top: 0; color: var(--accent); border-bottom: 1px solid #2a2e45; padding-bottom: 10px; font-size: 16px; text-transform: uppercase; }
+        
+        /* 3D Visualizer */
+        .scene { width: 100%; height: 250px; perspective: 600px; display: flex; justify-content: center; align-items: center; background: #0a0c13; border-radius: 8px; overflow: hidden;}
+        .drone-model { width: 120px; height: 20px; background: #ccc; position: relative; transform-style: preserve-3d; transition: transform 0.05s linear; }
+        .drone-model::before, .drone-model::after { content: ''; position: absolute; top: -10px; width: 40px; height: 40px; border-radius: 50%; border: 3px solid rgba(0, 210, 255, 0.5); }
+        .drone-model::before { left: -30px; } .drone-model::after { right: -30px; }
+        
+        /* Inputs & Buttons */
+        .pid-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; background: #151824; padding: 10px; border-radius: 6px; }
+        .pid-row label { font-weight: bold; width: 80px; }
+        input[type="number"] { background: #0a0c13; border: 1px solid #3a3e55; color: white; padding: 8px; border-radius: 4px; width: 70px; text-align: center; font-family: monospace; font-size: 16px; }
+        button { background: #3a3e55; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; text-transform: uppercase; font-size: 12px; letter-spacing: 1px; }
+        button:hover { background: #4a4e65; }
+        .btn-primary { background: var(--accent); color: #000; }
+        .btn-primary:hover { background: #00b8e6; }
+        
+        /* Graphing */
+        .graph-container { background: var(--chart-bg); border-radius: 8px; border: 1px solid #2a2e45; padding: 10px; position: relative; width: 100%; height: 400px; box-sizing: border-box; }
+        canvas { display: block; width: 100%; height: 100%; }
+        .graph-legend { display: flex; gap: 15px; margin-top: 15px; justify-content: center; font-family: monospace; font-size: 14px; }
+        .legend-item { display: flex; align-items: center; gap: 5px; cursor: pointer;}
+        .color-box { width: 12px; height: 12px; border-radius: 3px; }
+
+        /* Receiver Bars */
+        .channel-row { display: flex; align-items: center; margin-bottom: 12px; }
+        .channel-label { width: 60px; font-weight: bold; font-size: 14px; }
+        .channel-val { width: 50px; font-family: monospace; text-align: right; margin-right: 15px; color: #aaa; }
+        .bar-bg { flex-grow: 1; background: #0a0c13; height: 24px; border-radius: 12px; overflow: hidden; position: relative; border: 1px solid #2a2e45; }
+        .bar-fill { height: 100%; background: linear-gradient(90deg, #2ed573, #00d2ff); width: 0%; position: absolute; left: 0; transition: width 0.05s linear; }
+        .center-mark { position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: rgba(255,255,255,0.3); z-index: 10;}
+
+        /* Documentation Styling */
+        .doc-step { margin-bottom: 30px; border-left: 2px solid var(--accent); padding-left: 20px; }
+        .doc-step h2 { color: var(--accent); font-size: 18px; text-transform: uppercase; margin-top: 0; }
+        .math-block { background: #0c0e16; padding: 15px; border-radius: 8px; font-family: 'Times New Roman', serif; font-size: 1.1em; text-align: center; margin: 10px 0; border: 1px solid #2a2e45; }
+        .code-logic { background: #000; padding: 15px; border-radius: 8px; border: 1px solid #333; margin: 15px 0; overflow-x: auto; }
+        .code-logic pre { margin: 0; }
+        .code-logic code { font-family: 'Consolas', monospace; color: #2ed573; font-size: 13px; line-height: 1.5; }
+        .highlight { color: var(--accent); font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <div class="logo">BICOPTER OS</div>
+        <div class="menu-item active" onclick="switchTab('setup', this)">SETUP & VTX</div>
+        <div class="menu-item" onclick="switchTab('blackbox', this)">LIVE BLACKBOX</div>
+        <div class="menu-item" onclick="switchTab('pid', this)">PID TUNING</div>
+        <div class="menu-item" onclick="switchTab('receiver', this)">RECEIVER</div>
+        <div class="menu-item" onclick="switchTab('documentation', this)" style="color: var(--accent); border-top: 1px solid #2a2e45;">DOCUMENTATION</div>
+    </div>
+
+    <div class="main">
+        <div class="header">
+            <div id="status" class="status-badge disconnected">Disconnected</div>
+            <div><button class="btn-primary" onclick="sendCmd({cmd: 'save'})">Save to EEPROM</button></div>
+        </div>
+
+        <div id="setup" class="tab-content">
+            <div class="grid-2">
+                <div class="card">
+                    <h3>Live 3D Orientation</h3>
+                    <div class="scene"><div class="drone-model" id="model"></div></div>
+                    <div style="display:flex; justify-content: space-around; margin-top: 15px; font-family: monospace; font-size: 16px;">
+                        <div>R: <span id="txt-roll" style="color:var(--accent)">0.0</span>&deg;</div>
+                        <div>P: <span id="txt-pitch" style="color:var(--accent)">0.0</span>&deg;</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Sensors & Actions</h3>
+                    <p style="color: #aaa; font-size: 14px; margin-bottom: 20px;">Place the drone on a perfectly level surface before calibrating the IMU.</p>
+                    <button class="btn-primary" style="width: 100%; margin-bottom: 15px; padding: 20px;" onclick="sendCmd({cmd: 'cal'})">Calibrate Accelerometer</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="blackbox" class="tab-content" style="display: none; height: 100%;">
+            <div class="card" style="height: calc(100% - 60px); display: flex; flex-direction: column;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3>Step Response Graph</h3>
+                    <div><button onclick="toggleGraph()" id="btn-pause">PAUSE GRAPH</button></div>
+                </div>
+                <div class="graph-container"><canvas id="tuningGraph"></canvas></div>
+                <div class="graph-legend">
+                    <div class="legend-item" onclick="toggleTrace('tr')"><div class="color-box" style="background:#fff; border: 1px dashed #666"></div> Target Roll</div>
+                    <div class="legend-item" onclick="toggleTrace('r')"><div class="color-box" style="background:#00d2ff"></div> Actual Roll</div>
+                    <div class="legend-item" style="margin-left: 20px;" onclick="toggleTrace('tp')"><div class="color-box" style="background:#fff; border: 1px dashed #666"></div> Target Pitch</div>
+                    <div class="legend-item" onclick="toggleTrace('p')"><div class="color-box" style="background:#ff4757"></div> Actual Pitch</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="pid" class="tab-content" style="display: none;">
+            <div class="grid-2">
+                <div class="card">
+                    <h3>Roll PID</h3>
+                    <div class="pid-row"><label>Angle P</label><input type="number" id="akp" step="0.01" value="1.93"></div>
+                    <div class="pid-row"><label>Rate P</label><input type="number" id="rkp" step="0.01" value="0.13"></div>
+                    <div class="pid-row"><label>Rate I</label><input type="number" id="rki" step="0.01" value="0.03"></div>
+                    <div class="pid-row"><label>Rate D</label><input type="number" id="rkd" step="0.01" value="0.00"></div>
+                </div>
+                <div class="card">
+                    <h3>Pitch PID</h3>
+                    <div class="pid-row"><label>Angle P</label><input type="number" id="pakp" step="0.01" value="2.50"></div>
+                    <div class="pid-row"><label>Rate P</label><input type="number" id="prkp" step="0.01" value="0.15"></div>
+                    <div class="pid-row"><label>Rate I</label><input type="number" id="prki" step="0.01" value="0.01"></div>
+                    <div class="pid-row"><label>Rate D</label><input type="number" id="prkd" step="0.01" value="0.02"></div>
+                </div>
+                <div class="card">
+                    <h3>Yaw PID</h3>
+                    <div class="pid-row"><label>Rate P</label><input type="number" id="ykp" step="0.01" value="0.25"></div>
+                    <div class="pid-row"><label>Rate I</label><input type="number" id="yki" step="0.01" value="0.01"></div>
+                    <div class="pid-row"><label>Rate D</label><input type="number" id="ykd" step="0.01" value="0.00"></div>
+                </div>
+                <div class="card" style="display: flex; align-items: flex-end;">
+                    <button class="btn-primary" style="width: 100%; padding: 20px; font-size: 16px;" onclick="savePIDs()">APPLY PID VALUES</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="receiver" class="tab-content" style="display: none;">
+            <div class="card" style="max-width: 600px; margin: 0 auto;">
+                <h3>Channel Map</h3>
+                <div class="channel-row"><div class="channel-label">Roll</div><div class="channel-val" id="val-r">1500</div><div class="bar-bg"><div class="center-mark"></div><div class="bar-fill" id="bar-r"></div></div></div>
+                <div class="channel-row"><div class="channel-label">Pitch</div><div class="channel-val" id="val-p">1500</div><div class="bar-bg"><div class="center-mark"></div><div class="bar-fill" id="bar-p"></div></div></div>
+                <div class="channel-row"><div class="channel-label">Throttle</div><div class="channel-val" id="val-t">1000</div><div class="bar-bg"><div class="bar-fill" id="bar-t" style="background:#f39c12"></div></div></div>
+                <div class="channel-row"><div class="channel-label">Yaw</div><div class="channel-val" id="val-y">1500</div><div class="bar-bg"><div class="center-mark"></div><div class="bar-fill" id="bar-y"></div></div></div>
+                <div class="channel-row" style="margin-top: 25px;"><div class="channel-label" style="color:#e056fd">AUX/ARM</div><div class="channel-val" id="val-a">1000</div><div class="bar-bg"><div class="bar-fill" id="bar-a" style="background:#e056fd"></div></div></div>
+            </div>
+        </div>
+
+        <div id="documentation" class="tab-content" style="display: none;">
+            <div class="card">
+                <div class="doc-step">
+                    <h2>Step 1: The Physics of Tandem Flight</h2>
+                    <p>This bicopter utilizes two rotors. Control is achieved by modulating the <span class="highlight">RPM difference</span> for Pitch and the <span class="highlight">Servo Angle</span> for Roll/Yaw.</p>
+                </div>
+
+                <div class="doc-step">
+                    <h2>Step 2: Mathematical Foundation</h2>
+                    <h3>A. Pitch (Differential Thrust)</h3>
+                    <div class="math-block">
+                        $$Motor_{Front} = Base - Output_{Pitch}$$
+                        $$Motor_{Back} = Base + Output_{Pitch}$$
+                    </div>
+                    <h3>B. Roll & Yaw (Vector Mixing)</h3>
+                    <div class="math-block">
+                        $$Servo_{Front} = Center + Output_{Roll} + Output_{Yaw}$$
+                        $$Servo_{Back} = Center - Output_{Roll} + Output_{Yaw}$$
+                    </div>
+                </div>
+
+                <div class="doc-step">
+                    <h2>Step 3: Flight Controller Core Logic (C++)</h2>
+                    <p>The stabilization loop processes MPU6050 data and calculates actuator signals at 100Hz+.</p>
+                    <div class="code-logic">
+                        <pre><code>
+void loop() {
+    mpu.update(); // 1. Get IMU Angles
+    float roll_act = mpu.getAngleX();
+    float pitch_act = mpu.getAngleY();
+
+    // 2. PID Calculations
+    float out_r = pidRoll.compute(roll_set - roll_act);
+    float out_p = pidPitch.compute(pitch_set - pitch_act);
+    float out_y = pidYaw.compute(yaw_set - gyro_z);
+
+    // 3. Actuator Mixing Logic
+    int mot_f = throttle - out_p;
+    int mot_b = throttle + out_p;
+    int srv_f = FRONT_MID + out_r + out_y;
+    int srv_b = BACK_MID  - out_r + out_y;
+
+    // 4. Send to PCA9685 Hardware
+    if (is_armed && throttle > 1050) {
+        pwm.setPWM(ESC_F, 0, constrain(mot_f, 1000, 2000));
+        pwm.setPWM(ESC_B, 0, constrain(mot_b, 1000, 2000));
+        pwm.setPWM(SRV_F, 0, constrain(srv_f, 150, 450));
+        pwm.setPWM(SRV_B, 0, constrain(srv_b, 150, 450));
+    }
+}
+                        </code></pre>
+                    </div>
+                </div>
+
+                <div class="doc-step">
+                    <h2>Step 4: Operational Procedures</h2>
+                    <p><b>1. Calibration:</b> Place on a level surface and click 'Calibrate Accelerometer' to zero the IMU.</p>
+                    <p><b>2. Tuning:</b> Increase <b>P</b> until oscillation occurs, then dampen with <b>D</b>. Use the Blackbox tab to visualize the Step Response.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- UI Logic ---
+        function switchTab(tabId, element) {
+            document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
+            document.querySelectorAll('.menu-item').forEach(m => m.classList.remove('active'));
+            document.getElementById(tabId).style.display = 'block';
+            element.classList.add('active');
+            if(tabId === 'blackbox') resizeCanvas();
+        }
+
+        // --- Graphing Engine ---
+        const canvas = document.getElementById('tuningGraph');
+        const ctx = canvas.getContext('2d');
+        const maxDataPoints = 250;
+        let graphData = [];
+        let graphPaused = false;
+        let traces = { tr: true, r: true, tp: false, p: false };
+
+        function resizeCanvas() {
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        function toggleGraph() {
+            graphPaused = !graphPaused;
+            document.getElementById('btn-pause').innerText = graphPaused ? "RESUME GRAPH" : "PAUSE GRAPH";
+            document.getElementById('btn-pause').style.background = graphPaused ? "#f39c12" : "#3a3e55";
+        }
+
+        function toggleTrace(id) {
+            traces[id] = !traces[id];
+            event.currentTarget.style.opacity = traces[id] ? "1" : "0.3";
+        }
+
+        function renderGraph() {
+            if(!canvas.width) return;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = '#2a2e45'; ctx.lineWidth = 1;
+            for(let i=0; i<5; i++) {
+                let y = (canvas.height / 4) * i;
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+            }
+            let midY = canvas.height / 2;
+            ctx.strokeStyle = '#555'; ctx.beginPath(); ctx.moveTo(0, midY); ctx.lineTo(canvas.width, midY); ctx.stroke();
+            if(graphData.length === 0) return;
+
+            const xStep = canvas.width / (maxDataPoints - 1);
+            const scaleY = (canvas.height / 2) / 45;
+
+            function drawLine(key, color, isDashed) {
+                if(!traces[key]) return;
+                ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 2;
+                ctx.setLineDash(isDashed ? [5, 5] : []);
+                for(let i=0; i<graphData.length; i++) {
+                    let x = i * xStep;
+                    let y = midY - (graphData[i][key] * scaleY);
+                    if(i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke(); ctx.setLineDash([]);
+            }
+            drawLine('tr', 'rgba(255,255,255,0.7)', true);
+            drawLine('r', '#00d2ff', false);
+            drawLine('tp', 'rgba(255,255,255,0.7)', true);
+            drawLine('p', '#ff4757', false);
+        }
+
+        function updateGraphData(data) {
+            if(graphPaused) return;
+            graphData.push({ tr: data.t_r, r: data.r, tp: data.t_p, p: data.p });
+            if(graphData.length > maxDataPoints) graphData.shift();
+            requestAnimationFrame(renderGraph);
+        }
+
+        // --- WebSocket Logic ---
+        let ws;
+        function connect() {
+            ws = new WebSocket('ws://192.168.4.1:81/');
+            const status = document.getElementById('status');
+            ws.onopen = () => { status.innerText = "CONNECTED (Port 81)"; status.className = "status-badge connected"; };
+            ws.onclose = () => { status.innerText = "DISCONNECTED - Reconnecting..."; status.className = "status-badge disconnected"; setTimeout(connect, 2000); };
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if(data.type === "telem") {
+                    document.getElementById('model').style.transform = `rotateX(${data.p}deg) rotateZ(${-data.r}deg)`;
+                    document.getElementById('txt-roll').innerText = data.r.toFixed(1);
+                    document.getElementById('txt-pitch').innerText = data.p.toFixed(1);
+                    updateGraphData(data);
+                    if(data.rc) {
+                        const ids = ['r', 'p', 't', 'y', 'a'];
+                        for(let i=0; i<5; i++) {
+                            let val = data.rc[i];
+                            document.getElementById(`val-${ids[i]}`).innerText = val;
+                            let pct = Math.max(0, Math.min(100, ((val - 1000) / 1000) * 100));
+                            document.getElementById(`bar-${ids[i]}`).style.width = pct + '%';
+                        }
+                    }
+                }
+            };
+        }
+
+        function sendCmd(obj) { if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+        function savePIDs() {
+            const keys = ['akp', 'rkp', 'rki', 'rkd', 'pakp', 'prkp', 'prki', 'prkd', 'ykp', 'yki', 'ykd'];
+            let payload = { cmd: "set_pid" };
+            keys.forEach(k => { payload[k] = parseFloat(document.getElementById(k).value); });
+            sendCmd(payload);
+            const btn = event.target; btn.innerText = "SAVED & APPLIED!"; btn.style.background = "var(--success)";
+            setTimeout(() => { btn.innerText = "APPLY PID VALUES"; btn.style.background = "var(--accent)"; }, 1500);
+        }
+
+        connect(); resizeCanvas();
+    </script>
+</body>
+</html>
