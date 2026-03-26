@@ -3,6 +3,8 @@
  BICOPTER OS - WEBSOCKET MASTER FIRMWARE (PRO BLACKBOX EDITION)
  Features: Lean Flight Logic, 50Hz Telemetry, Setpoint Tracking, Live Trim
  ============================================================================
+ latest firmware that has the wifi tuning capability with real time pid graph and telemetry , tuning etc compatible with the index.html file
+ dated 26.03.2026
 */
 
 #include <WiFi.h>
