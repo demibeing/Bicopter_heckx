@@ -48,6 +48,12 @@ float target_roll = 0, target_pitch = 0;
 float gr_bias = 0, gp_bias = 0, gz_bias = 0;
 unsigned long last_time, last_telem_time = 0;
 
+// --- Filter Variables ---
+float prev_gr = 0, prev_gp = 0, prev_gz = 0;
+float dr_filtered = 0, dp_filtered = 0, dz_filtered = 0;
+const float D_CUTOFF_HZ = 30.0; // Tune this: 20Hz-40Hz is ideal for bi-copters
+unsigned long last_loop_time = 0;
+
 volatile unsigned long rc_roll_val=1500, rc_pitch_val=1500, rc_thr_val=1000, rc_aux_val=1000, rc_yaw_val=1500;
 volatile unsigned long r_start, p_start, t_start, a_start, y_start, last_rc_time = 0;
 
@@ -153,17 +159,37 @@ void setup() {
 }
 
 void loop() {
+ void loop() {
   webSocket.loop();
   
+  unsigned long now = micros(); 
+  // MAJOR UPGRADE: Lock control loop to 250Hz (4000us) for stable PID math
+  if (now - last_loop_time < 4000) return; 
+  
+  float dt = (now - last_loop_time) / 1000000.0f; 
+  last_loop_time = now;
+
   sensors_event_t a, g, t_s; mpu.getEvent(&a, &g, &t_s);
-  unsigned long now = micros(); float dt = (now - last_time) / 1000000.0f; 
-  if (dt <= 0 || dt > 0.05) dt = 0.01; last_time = now;
 
   float gr = (g.gyro.y - gr_bias) * 57.3; 
   float gp = (g.gyro.x - gp_bias) * 57.3; 
   float gz = (g.gyro.z - gz_bias) * 57.3;
   roll_angle = 0.98*(roll_angle + gr*dt) + 0.02*(atan2(a.acceleration.x, a.acceleration.z)*57.3);
   pitch_angle = 0.98*(pitch_angle + gp*dt) + 0.02*(atan2(a.acceleration.y, a.acceleration.z)*57.3);
+
+  // --- MAJOR UPGRADE: True Derivative Calculation ---
+  float dr_raw = (gr - prev_gr) / dt;
+  float dp_raw = (gp - prev_gp) / dt;
+  float dz_raw = (gz - prev_gz) / dt;
+  prev_gr = gr; prev_gp = gp; prev_gz = gz;
+
+  // --- MAJOR UPGRADE: PT1 Low-Pass Filter on D-Term ---
+  float rc = 1.0f / (2.0f * PI * D_CUTOFF_HZ);
+  float alpha = dt / (rc + dt);
+  
+  dr_filtered = dr_filtered + alpha * (dr_raw - dr_filtered);
+  dp_filtered = dp_filtered + alpha * (dp_raw - dp_filtered);
+  dz_filtered = dz_filtered + alpha * (dz_raw - dz_filtered);
 
   noInterrupts(); 
   long p_r=rc_roll_val, p_p=rc_pitch_val, p_t=rc_thr_val, p_a=rc_aux_val, p_y=rc_yaw_val; 
@@ -185,15 +211,18 @@ void loop() {
   
   float r_err = r_des - gr; float p_err = p_des - gp; float y_err = y_des - gz;
 
+  // Anti-windup integration
   if(p_t > 1050) {
     roll_i = constrain(roll_i + r_err*dt, -I_TERM_LIMIT, I_TERM_LIMIT);
     pitch_i = constrain(pitch_i + p_err*dt, -I_TERM_LIMIT, I_TERM_LIMIT);
     yaw_i = constrain(yaw_i + y_err*dt, -I_TERM_LIMIT, I_TERM_LIMIT);
   } else { roll_i = pitch_i = yaw_i = 0; }
 
-  float r_out = (RKP*r_err) + (RKI*roll_i) + (RKD*-gr) + (r_stick*RFF);
-  float p_out = (PRKP*p_err) + (PRKI*pitch_i) + (PRKD*-gp);
-  float y_out = (YKP*y_err) + (YKI*yaw_i) + (YKD*-gz);
+  // --- MAJOR UPGRADE: Applying the filtered derivative ---
+  // Notice we use the filtered angular acceleration (dr_filtered), not just raw gyro (gr)
+  float r_out = (RKP*r_err) + (RKI*roll_i) - (RKD*dr_filtered) + (r_stick*RFF);
+  float p_out = (PRKP*p_err) + (PRKI*pitch_i) - (PRKD*dp_filtered);
+  float y_out = (YKP*y_err) + (YKI*yaw_i) - (YKD*dz_filtered);
 
   if(p_t > 1050) {
     pwm.setPWM(SERVO_FRONT_CH, 0, constrain(FRONT_MID + (int)r_out + (int)y_out, FRONT_MID-SERVO_LIMIT, FRONT_MID+SERVO_LIMIT));
@@ -206,7 +235,7 @@ void loop() {
     pwm.setPWM(ESC_FRONT_CH, 0, ESC_MIN); pwm.setPWM(ESC_BACK_CH, 0, ESC_MIN);
   }
 
-  // --- UPGRADED TELEMETRY STREAM (50Hz) ---
+  // --- TELEMETRY STREAM ---
   if (millis() - last_telem_time > 20) {
     last_telem_time = millis();
     StaticJsonDocument<256> t_doc;
@@ -218,4 +247,5 @@ void loop() {
     String jsonString; serializeJson(t_doc, jsonString);
     webSocket.broadcastTXT(jsonString);
   }
+}
 }
