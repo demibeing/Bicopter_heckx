@@ -1,225 +1,311 @@
-/*
- ============================================================================
-  BICOPTER PRO FLIGHT CONTROLLER v3.2 (Feedforward + Aux Kill Switch)
-  
-  New Feature: 
-  - Roll Feedforward (RFF): Directly links RC stick to Servo output.
-  - Keeps stabilization target at 30° but allows full mechanical servo throw.
- ============================================================================
-*/
+//latest code with direct esp32 pins and telemetry
+//failsafe,proper priority loop
+//dated: 03-04-2026
+
 
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_PWMServoDriver.h>
+#include <MPU6050_light.h> 
+#include <ESP32Servo.h> 
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
 #include <EEPROM.h>
 
-// ============================================================================
-// 1. HARDWARE PINS & CHANNELS
-// ============================================================================
-#define RC_ROLL_PIN  34
-#define RC_PITCH_PIN 35
-#define RC_THR_PIN   25 
-#define RC_AUX_PIN   36 
+// --- Network Setup ---
+const char* ssid = "Bicopter_OS";
+const char* password = "12345678";
+WebSocketsServer webSocket = WebSocketsServer(81);
 
-#define SERVO_FREQ 50    
-#define PCA9685_ADDR 0x40
+// --- Hardware Pins ---
+#define RC_ROLL_PIN  35
+#define RC_PITCH_PIN 34
+#define RC_THR_PIN   25
+#define RC_YAW_PIN   2
+#define RC_AUX_PIN   39
 
-const int SERVO_FRONT_CH = 0;
-const int SERVO_BACK_CH  = 1;
-const int ESC_FRONT_CH   = 14;
-const int ESC_BACK_CH    = 15;
+const int ESC_FRONT_PIN = 16;
+const int ESC_BACK_PIN  = 17;
+const int SERVO_FRONT_PIN = 26;
+const int SERVO_BACK_PIN  = 27;
 
-// ============================================================================
-// 2. LIMITS & OFFSETS
-// ============================================================================
-const int FRONT_MID = 300; 
-const int BACK_MID  = 300; 
-const int SERVO_LIMIT = 85; 
+// --- Limits & Trims (Strictly Microseconds) ---
+int FRONT_MID_US = 1400; // Adjusted from your tick math
+int BACK_MID_US  = 1500;
+const int SERVO_LIMIT_US = 300; 
 
-const int ESC_MIN  = 150;   
-const int ESC_IDLE = 225;   
-const int ESC_MAX  = 410;   
+const int ESC_MIN_US  = 1000; 
+const int ESC_IDLE_US = 1050;  
+const int ESC_MAX_US  = 2000;  
 
-const int CORRECTION_DIR_ROLL = 1; 
-
-// ============================================================================
-// 3. PID & FEEDFORWARD GAINS
-// ============================================================================
-float AKP = 1.93;
-float RKP = 0.13;
-float RKI = 0.03;
-float RKD = 0.00;
-float RFF = 50.0; // <--- NEW: Roll Feedforward. Increase for more "snap"
-
-float PAKP = 3.0;
-float PRKP = 0.15;
-float PRKI = 0.05;
-float PRKD = 0.05; 
+// -------- PID VALUES --------
+float AKP = 1.930, RKP = 0.130, RKI = 0.030, RKD = 0.000, RFF = 50.0;
+float PAKP = 2.500, PRKP = 0.150, PRKI = 0.010, PRKD = 0.020;
+float YKP = 0.250, YKI = 0.010, YKD = 0.000;
 
 const float I_TERM_LIMIT = 250.0;
-const float MAX_DES_RATE = 400.0; 
+const float MAX_RATE = 400.0;
 
-// ============================================================================
-// 4. GLOBAL STATE
-// ============================================================================
-Adafruit_MPU6050 mpu;
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
+// --- System State ---
+MPU6050 mpu(Wire); 
+Servo escFront, escBack, servoFront, servoBack;
 
-float roll_angle = 0, pitch_angle = 0, roll_i = 0, pitch_i = 0;
-float gr_bias = 0, gp_bias = 0; 
-unsigned long last_time;
+float roll_angle = 0, pitch_angle = 0;
+float roll_i = 0, pitch_i = 0, yaw_i = 0;
+float target_roll = 0, target_pitch = 0;
 
-volatile unsigned long rc_roll_val=1500, rc_pitch_val=1500, rc_thr_val=1000, rc_aux_val=1000;
-volatile unsigned long r_start, p_start, t_start, a_start;
+float prev_gr = 0, prev_gp = 0, prev_gz = 0;
+float dr_filtered = 0, dp_filtered = 0, dz_filtered = 0;
+const float D_CUTOFF_HZ = 30.0; 
+
+unsigned long loop_timer = 0;
+unsigned long last_telem_time = 0; 
+const unsigned long LOOP_TIME_US = 4000; // 250Hz
+
+// RC Interrupt Variables
+volatile unsigned long r_start=0, p_start=0, t_start=0, a_start=0, y_start=0;
+volatile long rc_roll_val=1500, rc_pitch_val=1500, rc_thr_val=1000, rc_aux_val=1000, rc_yaw_val=1500;
 volatile unsigned long last_rc_time = 0; 
 
-const int EEPROM_SIZE = 128;
-const uint32_t EEPROM_MAGIC = 0xB1C0DE25; // Updated magic version
+// Safe RC Variables for Loop
+long p_r = 1500, p_p = 1500, p_t = 1000, p_y = 1500, p_a = 1000;
+unsigned long signal_age = 0;
 
-// ============================================================================
-// 5. INTERRUPTS, SAVE/LOAD
-// ============================================================================
-void IRAM_ATTR readRoll()  { if(digitalRead(RC_ROLL_PIN)) r_start = micros(); else { rc_roll_val = micros()-r_start; last_rc_time = micros(); } }
-void IRAM_ATTR readPitch() { if(digitalRead(RC_PITCH_PIN)) p_start = micros(); else rc_pitch_val = micros()-p_start; }
-void IRAM_ATTR readThr()   { if(digitalRead(RC_THR_PIN)) t_start = micros(); else { rc_thr_val = micros()-t_start; last_rc_time = micros(); } }
-void IRAM_ATTR readAux()   { if(digitalRead(RC_AUX_PIN)) a_start = micros(); else { rc_aux_val = micros()-a_start; last_rc_time = micros(); } }
+bool calibration_requested = false;
+bool is_armed = false;
 
-void saveGains() {
-  EEPROM.writeUInt(0, EEPROM_MAGIC);
-  float g[] = {AKP, RKP, RKI, RKD, PAKP, PRKP, PRKI, PRKD, RFF};
-  for(int i=0; i<9; i++) EEPROM.writeFloat(4 + (i*4), g[i]);
+const uint32_t EEPROM_MAGIC = 0xB1C0DE54; // Updated to wipe old tick data
+
+// --- Helpers ---
+float applyDeadband(float value, float deadband) {
+  if(abs(value) < deadband) return 0;
+  return (value > 0) ? value - deadband : value + deadband;
+}
+
+void resetPIDState() {
+  roll_i = pitch_i = yaw_i = 0;
+  prev_gr = mpu.getGyroY(); prev_gp = mpu.getGyroX(); prev_gz = mpu.getGyroZ();
+  dr_filtered = dp_filtered = dz_filtered = 0;
+}
+
+// --- EEPROM Management ---
+void saveToEEPROM() {
+  int addr = 0;
+  EEPROM.put(addr, EEPROM_MAGIC); addr += sizeof(EEPROM_MAGIC);
+  EEPROM.put(addr, AKP); addr += sizeof(AKP); EEPROM.put(addr, RKP); addr += sizeof(RKP);
+  EEPROM.put(addr, RKI); addr += sizeof(RKI); EEPROM.put(addr, RKD); addr += sizeof(RKD);
+  EEPROM.put(addr, PAKP); addr += sizeof(PAKP); EEPROM.put(addr, PRKP); addr += sizeof(PRKP);
+  EEPROM.put(addr, PRKI); addr += sizeof(PRKI); EEPROM.put(addr, PRKD); addr += sizeof(PRKD);
+  EEPROM.put(addr, YKP); addr += sizeof(YKP); EEPROM.put(addr, YKI); addr += sizeof(YKI);
+  EEPROM.put(addr, YKD); addr += sizeof(YKD);
+  EEPROM.put(addr, FRONT_MID_US); addr += sizeof(FRONT_MID_US);
+  EEPROM.put(addr, BACK_MID_US); addr += sizeof(BACK_MID_US);
   EEPROM.commit();
-  Serial.println("SAVED");
 }
 
-void loadGains() {
-  if(EEPROM.readUInt(0) != EEPROM_MAGIC) return; 
-  AKP = EEPROM.readFloat(4);  RKP = EEPROM.readFloat(8);
-  RKI = EEPROM.readFloat(12); RKD = EEPROM.readFloat(16);
-  PAKP = EEPROM.readFloat(20); PRKP = EEPROM.readFloat(24);
-  PRKI = EEPROM.readFloat(28); PRKD = EEPROM.readFloat(32);
-  RFF  = EEPROM.readFloat(36); // Load Feedforward
+void loadFromEEPROM() {
+  uint32_t magic; int addr = 0;
+  EEPROM.get(addr, magic); addr += sizeof(magic);
+  if(magic == EEPROM_MAGIC) {
+    EEPROM.get(addr, AKP); addr += sizeof(AKP); EEPROM.get(addr, RKP); addr += sizeof(RKP);
+    EEPROM.get(addr, RKI); addr += sizeof(RKI); EEPROM.get(addr, RKD); addr += sizeof(RKD);
+    EEPROM.get(addr, PAKP); addr += sizeof(PAKP); EEPROM.get(addr, PRKP); addr += sizeof(PRKP);
+    EEPROM.get(addr, PRKI); addr += sizeof(PRKI); EEPROM.get(addr, PRKD); addr += sizeof(PRKD);
+    EEPROM.get(addr, YKP); addr += sizeof(YKP); EEPROM.get(addr, YKI); addr += sizeof(YKI);
+    EEPROM.get(addr, YKD); addr += sizeof(YKD);
+    EEPROM.get(addr, FRONT_MID_US); addr += sizeof(FRONT_MID_US);
+    EEPROM.get(addr, BACK_MID_US); addr += sizeof(BACK_MID_US);
+  }
 }
 
-// ============================================================================
-// 7. SETUP
-// ============================================================================
+// --- RC Interrupts ---
+void IRAM_ATTR readRoll()  { if(digitalRead(RC_ROLL_PIN)) r_start = micros(); else { rc_roll_val = micros() - r_start; last_rc_time = micros(); } }
+void IRAM_ATTR readPitch() { if(digitalRead(RC_PITCH_PIN)) p_start = micros(); else { rc_pitch_val = micros() - p_start; last_rc_time = micros(); } }
+void IRAM_ATTR readThr()   { if(digitalRead(RC_THR_PIN)) t_start = micros(); else { rc_thr_val = micros() - t_start; last_rc_time = micros(); } }
+void IRAM_ATTR readAux()   { if(digitalRead(RC_AUX_PIN)) a_start = micros(); else { rc_aux_val = micros() - a_start; last_rc_time = micros(); } }
+void IRAM_ATTR readYaw()   { if(digitalRead(RC_YAW_PIN)) y_start = micros(); else { rc_yaw_val = micros() - y_start; last_rc_time = micros(); } }
+
+// --- WebSocket Handler ---
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    StaticJsonDocument<256> doc;
+    if (!deserializeJson(doc, payload)) {
+      String cmd = doc["cmd"];
+      if (cmd == "set_pid") {
+        if(doc.containsKey("akp")) AKP = doc["akp"]; if(doc.containsKey("rkp")) RKP = doc["rkp"];
+        if(doc.containsKey("rki")) RKI = doc["rki"]; if(doc.containsKey("rkd")) RKD = doc["rkd"];
+        if(doc.containsKey("pakp")) PAKP = doc["pakp"]; if(doc.containsKey("prkp")) PRKP = doc["prkp"];
+        if(doc.containsKey("prki")) PRKI = doc["prki"]; if(doc.containsKey("prkd")) PRKD = doc["prkd"];
+        if(doc.containsKey("ykp")) YKP = doc["ykp"]; if(doc.containsKey("yki")) YKI = doc["yki"];
+        if(doc.containsKey("ykd")) YKD = doc["ykd"];
+      } 
+      else if (cmd == "set_trim") {
+        if(doc.containsKey("f_mid")) FRONT_MID_US = doc["f_mid"];
+        if(doc.containsKey("b_mid")) BACK_MID_US = doc["b_mid"];
+      }
+      else if (cmd == "cal") { calibration_requested = true; } 
+      else if (cmd == "save") { saveToEEPROM(); }
+    }
+  }
+}
+
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
-  Wire.begin();
-  if(!mpu.begin()) while(1);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); 
-  pwm.begin(); pwm.setPWMFreq(SERVO_FREQ);
+  Wire.begin(); Wire.setClock(400000);
 
-  pwm.setPWM(ESC_FRONT_CH, 0, ESC_MIN);
-  pwm.setPWM(ESC_BACK_CH, 0, ESC_MIN);
-  delay(3000); 
+  EEPROM.begin(512); 
+  loadFromEEPROM();
 
-  for(int i=0; i<200; i++){
-    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-    gr_bias += g.gyro.y; gp_bias += g.gyro.x; delay(2);
+  WiFi.softAP(ssid, password);
+  webSocket.begin(); 
+  webSocket.onEvent(webSocketEvent);
+
+  if (mpu.begin() != 0) {
+    while (1) { Serial.println("MPU Fail"); delay(500); }
   }
-  gr_bias /= 200.0; gp_bias /= 200.0;
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-  pinMode(RC_ROLL_PIN, INPUT); pinMode(RC_PITCH_PIN, INPUT); 
-  pinMode(RC_THR_PIN, INPUT);  pinMode(RC_AUX_PIN, INPUT);
-  
+  pinMode(RC_ROLL_PIN, INPUT); pinMode(RC_PITCH_PIN, INPUT);
+  pinMode(RC_THR_PIN, INPUT);  pinMode(RC_AUX_PIN, INPUT); pinMode(RC_YAW_PIN, INPUT);
+
   attachInterrupt(RC_ROLL_PIN, readRoll, CHANGE);
   attachInterrupt(RC_PITCH_PIN, readPitch, CHANGE);
   attachInterrupt(RC_THR_PIN, readThr, CHANGE);
   attachInterrupt(RC_AUX_PIN, readAux, CHANGE);
+  attachInterrupt(RC_YAW_PIN, readYaw, CHANGE);
 
-  EEPROM.begin(EEPROM_SIZE);
-  loadGains();
-  last_time = micros();
+  ESP32PWM::allocateTimer(0); ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2); ESP32PWM::allocateTimer(3);
+  
+  escFront.setPeriodHertz(50); escBack.setPeriodHertz(50);
+  servoFront.setPeriodHertz(50); servoBack.setPeriodHertz(50);
+  
+  escFront.attach(ESC_FRONT_PIN, 1000, 2000); escBack.attach(ESC_BACK_PIN, 1000, 2000);
+  servoFront.attach(SERVO_FRONT_PIN, 500, 2500); servoBack.attach(SERVO_BACK_PIN, 500, 2500);
+
+  escFront.writeMicroseconds(ESC_MIN_US); escBack.writeMicroseconds(ESC_MIN_US);
+  servoFront.writeMicroseconds(FRONT_MID_US); servoBack.writeMicroseconds(BACK_MID_US);
+  delay(2000);
+
+  Serial.println("Calibrating MPU...");
+  mpu.calcOffsets(true, true); 
+  resetPIDState();
+
+  loop_timer = micros();
 }
 
-// ============================================================================
-// 8. LOOP
-// ============================================================================
+// ---------------- MAIN LOOP ----------------
 void loop() {
-  // --- SERIAL PARSER ---
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n'); line.trim();
-    if (line.startsWith("AKP ")) AKP = line.substring(4).toFloat();
-    else if (line.startsWith("RKP ")) RKP = line.substring(4).toFloat();
-    else if (line.startsWith("RKI ")) RKI = line.substring(4).toFloat();
-    else if (line.startsWith("RKD ")) RKD = line.substring(4).toFloat();
-    else if (line.startsWith("RFF ")) RFF = line.substring(4).toFloat(); // Support tuning RFF
-    else if (line.startsWith("PAKP ")) PAKP = line.substring(5).toFloat();
-    else if (line.startsWith("PRKP ")) PRKP = line.substring(5).toFloat();
-    else if (line.startsWith("PRKI ")) PRKI = line.substring(5).toFloat();
-    else if (line.startsWith("PRKD ")) PRKD = line.substring(5).toFloat();
-    else if (line == "SAVE") saveGains();
-    else if (line == "REQ") Serial.printf("SYNC,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", AKP, RKP, RKI, RKD, PAKP, PRKP, PRKI, PRKD, RFF);
+  // 1. Handle Background Tasks (WebSockets)
+  webSocket.loop(); 
+
+  // 2. Handle Runtime Calibration Request
+  if (calibration_requested) {
+    escFront.writeMicroseconds(ESC_MIN_US); escBack.writeMicroseconds(ESC_MIN_US);
+    servoFront.writeMicroseconds(FRONT_MID_US); servoBack.writeMicroseconds(BACK_MID_US);
+    mpu.calcOffsets(true, true);
+    resetPIDState();
+    calibration_requested = false;
+    loop_timer = micros(); // Prevent dt spike
   }
 
-  // --- SENSORS ---
-  sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
+  // 3. Strict Timing Control
   unsigned long now = micros();
-  float dt = (now - last_time) / 1000000.0f; 
-  if (dt <= 0 || dt > 0.05) dt = 0.01; 
-  last_time = now;
-
-  float gr = (g.gyro.y - gr_bias) * 57.2958;
-  float gp = (g.gyro.x - gp_bias) * 57.2958;
-  roll_angle = 0.99 * (roll_angle + gr * dt) + 0.01 * (atan2(a.acceleration.x, a.acceleration.z) * 57.2958);
-  pitch_angle = 0.99 * (pitch_angle + gp * dt) + 0.01 * (atan2(a.acceleration.y, a.acceleration.z) * 57.2958);
-
-  // --- RC & FAILSAFE ---
-  noInterrupts(); 
-  long p_roll = rc_roll_val; long p_pitch = rc_pitch_val;
-  long p_thr = rc_thr_val;  long p_aux = rc_aux_val;
-  unsigned long signal_age = micros() - last_rc_time;
-  interrupts(); 
-
-  bool kill_switch_active = (p_aux < 1500); 
-  bool failsafe_active = (signal_age > 100000 || p_thr < 800 || p_thr > 2200 || p_roll < 800 || kill_switch_active);
-
-  if (failsafe_active) { p_roll = 1500; p_pitch = 1500; p_thr = 1000; }
-
-  // --- ROLL LOGIC (WITH FEEDFORWARD) ---
-  float roll_stick_pos = (p_roll - 1500.0) / 500.0; // Normalized -1.0 to 1.0
-  float target_r = roll_stick_pos * 30.0;          // Stabilization limit still 30 deg
-  float rc_roll_ff = roll_stick_pos * RFF;         // Direct stick bypass
-
-  float r_des_rate = constrain(AKP * (target_r - roll_angle), -MAX_DES_RATE, MAX_DES_RATE);
-  float r_err = r_des_rate - gr;
+  if (now - loop_timer < LOOP_TIME_US) return; 
   
-  if (p_thr > 1050 && !failsafe_active) roll_i = constrain(roll_i + r_err * dt, -I_TERM_LIMIT, I_TERM_LIMIT);
-  else roll_i = 0; 
-  
-  // Total output = PID + Feedforward
-  float r_out = (RKP * r_err) + (RKI * roll_i) + (RKD * -gr) + rc_roll_ff; 
-  int r_def = constrain((int)(r_out * CORRECTION_DIR_ROLL), -SERVO_LIMIT, SERVO_LIMIT);
-  
-  pwm.setPWM(SERVO_FRONT_CH, 0, FRONT_MID + r_def);
-  pwm.setPWM(SERVO_BACK_CH, 0, BACK_MID - r_def);
+  float dt = (now - loop_timer) / 1000000.0f;
+  if(dt <= 0 || dt > 0.05) dt = 0.01; // Sanity check
+  loop_timer = now;
 
-  // --- PITCH LOGIC (MOTORS) ---
-  float target_p = ((p_pitch - 1500.0) / 500.0) * 30.0;
-  float p_des_rate = constrain(PAKP * (target_p - pitch_angle), -MAX_DES_RATE, MAX_DES_RATE);
-  float p_err = p_des_rate - gp;
-  
-  if (p_thr > 1050 && !failsafe_active) pitch_i = constrain(pitch_i + p_err * dt, -I_TERM_LIMIT, I_TERM_LIMIT);
-  else pitch_i = 0;
-  
-  float p_out = (PRKP * p_err) + (PRKI * pitch_i) + (PRKD * -gp);
+  // 4. Safe RC Polling & Failsafe Check
+  noInterrupts();
+  p_r = rc_roll_val; p_p = rc_pitch_val; p_t = rc_thr_val; p_y = rc_yaw_val; p_a = rc_aux_val;
+  signal_age = micros() - last_rc_time;
+  interrupts();
 
-  int esc_f = ESC_MIN, esc_b = ESC_MIN;
-  if (p_thr > 1050 && !failsafe_active) {
-    int base_throttle = map(p_thr, 1050, 2000, ESC_IDLE, ESC_MAX);
-    esc_f = constrain(base_throttle - (int)p_out, ESC_MIN, ESC_MAX);
-    esc_b = constrain(base_throttle + (int)p_out, ESC_MIN, ESC_MAX);
+  // Failsafe: Signal lost OR throttle wildly out of bounds
+  if (signal_age > 100000 || p_t < 800 || p_t > 2200) { 
+    p_r = 1500; p_p = 1500; p_y = 1500; p_t = 1000; p_a = 1000; 
   }
-  pwm.setPWM(ESC_FRONT_CH, 0, esc_f);
-  pwm.setPWM(ESC_BACK_CH, 0, esc_b);
 
-  // --- TELEMETRY ---
-  static unsigned long tlm_t = 0;
-  if(millis() - tlm_t > 100) { 
-    tlm_t = millis();
-    Serial.printf("TLM,%.1f,%.1f,%d,%d\n", roll_angle, pitch_angle, esc_f, esc_b);
+  bool kill_switch_active = (p_a > 1500) || (signal_age > 100000);
+  is_armed = (p_t > 1050 && !kill_switch_active);
+
+  // 5. Sensor Update
+  mpu.update(); 
+  float gr = mpu.getGyroY(), gp = mpu.getGyroX(), gz = mpu.getGyroZ();
+  float ax = mpu.getAccX(), ay = mpu.getAccY(), az = mpu.getAccZ();
+
+  roll_angle = 0.98*(roll_angle + gr*dt) + 0.02*(atan2(ax, az)*57.3);
+  pitch_angle = 0.98*(pitch_angle + gp*dt) + 0.02*(atan2(ay, az)*57.3);
+
+  // D-Term Filtering
+  float dr_raw = (gr - prev_gr) / dt;
+  float dp_raw = (gp - prev_gp) / dt;
+  float dz_raw = (gz - prev_gz) / dt;
+  prev_gr = gr; prev_gp = gp; prev_gz = gz;
+
+  float rc_filter = 1.0f / (2.0f * PI * D_CUTOFF_HZ);
+  float alpha = dt / (rc_filter + dt);
+  dr_filtered += alpha * (dr_raw - dr_filtered);
+  dp_filtered += alpha * (dp_raw - dp_filtered);
+  dz_filtered += alpha * (dz_raw - dz_filtered);
+
+  // 6. PID Math
+  float r_stick = applyDeadband((p_r-1500.0)/500.0, 0.05);
+  float p_stick = applyDeadband((p_p-1500.0)/500.0, 0.05);
+  float y_stick = applyDeadband((p_y-1500.0)/500.0, 0.05);
+
+  target_roll = r_stick * 30.0;
+  target_pitch = p_stick * 30.0;
+
+  float r_des = constrain(AKP*(target_roll-roll_angle), -MAX_RATE, MAX_RATE);
+  float p_des = constrain(PAKP*(target_pitch-pitch_angle), -MAX_RATE, MAX_RATE);
+  float y_des = y_stick * 400.0;
+
+  float r_err = r_des - gr; 
+  float p_err = p_des - gp; 
+  float y_err = y_des - gz;
+
+  if (is_armed) {
+    roll_i = constrain(roll_i + r_err*dt, -I_TERM_LIMIT, I_TERM_LIMIT);
+    pitch_i = constrain(pitch_i + p_err*dt, -I_TERM_LIMIT, I_TERM_LIMIT);
+    yaw_i = constrain(yaw_i + y_err*dt, -I_TERM_LIMIT, I_TERM_LIMIT);
+  } else {
+    resetPIDState(); // Prevents windup and jumping while sitting on the desk
+  }
+
+  float r_out = (RKP*r_err) + (RKI*roll_i) - (RKD*dr_filtered) + (r_stick*RFF);
+  float y_out = (YKP*y_err) + (YKI*yaw_i) - (YKD*dz_filtered);
+  float p_out = (PRKP*p_err) + (PRKI*pitch_i) - (PRKD*dp_filtered);
+
+  // 7. Output Routing
+  int f_cmd_us = constrain(FRONT_MID_US - (int)r_out + (int)y_out, FRONT_MID_US - SERVO_LIMIT_US, FRONT_MID_US + SERVO_LIMIT_US);
+  int b_cmd_us = constrain(BACK_MID_US  + (int)r_out + (int)y_out, BACK_MID_US  - SERVO_LIMIT_US, BACK_MID_US  + SERVO_LIMIT_US);
+
+  servoFront.writeMicroseconds(f_cmd_us);
+  servoBack.writeMicroseconds(b_cmd_us);
+
+  if (!is_armed) {
+    escFront.writeMicroseconds(ESC_MIN_US);
+    escBack.writeMicroseconds(ESC_MIN_US);
+  } 
+  else {
+    int base_throttle_us = map(p_t, 1000, 2000, ESC_IDLE_US, ESC_MAX_US);
+    escFront.writeMicroseconds(constrain(base_throttle_us - (int)p_out, ESC_MIN_US, ESC_MAX_US));
+    escBack.writeMicroseconds(constrain(base_throttle_us + (int)p_out, ESC_MIN_US, ESC_MAX_US));
+  }
+
+  // 8. Telemetry Stream
+  if (millis() - last_telem_time > 50) { // Reduced to 20Hz to prevent network lag
+    last_telem_time = millis();
+    StaticJsonDocument<256> t_doc;
+    t_doc["type"] = "telem";
+    t_doc["r"] = roll_angle; t_doc["p"] = pitch_angle;
+    t_doc["t_r"] = target_roll; t_doc["t_p"] = target_pitch; 
+    JsonArray rc = t_doc.createNestedArray("rc");
+    rc.add(p_r); rc.add(p_p); rc.add(p_t); rc.add(p_y); rc.add(p_a); 
+    String jsonString; serializeJson(t_doc, jsonString);
+    webSocket.broadcastTXT(jsonString);
   }
 }
